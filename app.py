@@ -81,7 +81,6 @@ def get_chapter_file_parts(selected_chapter):
     for path in matched_paths:
         try:
             remote_file = get_uploaded_gemini_file(path)
-            # Correctly reference uploaded files via URI
             uri_parts.append(
                 types.Part.from_uri(file_uri=remote_file.uri, mime_type="application/pdf")
             )
@@ -174,7 +173,7 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Attach the active chapter PDFs on the first user message using proper URI parts
+    # Attach active chapter PDFs on the first user message using proper URI parts
     gemini_contents = []
     for idx, m in enumerate(st.session_state.messages):
         role = "user" if m["role"] == "user" else "model"
@@ -188,7 +187,7 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
         with st.spinner("Thinking..."):
             try:
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.8-flash",
                     contents=gemini_contents,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
