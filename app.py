@@ -188,7 +188,7 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
         with st.spinner("Thinking..."):
             try:
                 response = client.models.generate_content(
-                    model="gemini-3.8-flash",
+                    model="gemini-2.5-flash",
                     contents=gemini_contents,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
