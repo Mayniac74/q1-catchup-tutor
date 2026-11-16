@@ -104,38 +104,42 @@ def get_filtered_context(docs_dict, web_context, selected_chapter):
         combined += "\n\n" + web_context
     return combined, matched_names
 
-# --- INITIALIZE GEMINI CLIENT & AUTO-DISCOVER AVAILABLE MODELS ---
+# --- INITIALIZE GEMINI CLIENT & FILTER FOR FREE-TIER COMPATIBLE FLASH MODELS ---
 def get_gemini_client():
     api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         st.error("Missing GEMINI_API_KEY. Please add it to Streamlit Secrets.")
         st.stop()
-    # Explicitly use v1beta so all current Gemini 3 models are exposed
     return genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
 
 client = get_gemini_client()
 
 @st.cache_data(ttl=3600)
-def get_available_models():
-    """Queries the API for valid generateContent models on this key, prioritizing Flash models."""
+def get_free_tier_models():
+    """Selects only standard Flash models that support Free Tier quotas (excludes omni/exp/2.0/pro)."""
     preferred_order = [
         "gemini-3.8-flash",
+        "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
-        "gemini-2.0-flash",
     ]
     discovered = []
     try:
         for m in client.models.list():
             name = m.name.replace("models/", "")
-            # Exclude non-chat models (embeddings, image-only, tts, robotics, etc.)
+            # Only keep standard flash models; exclude omni, experimental, 2.0, and non-text models
             if (
                 "gemini" in name
-                and ("flash" in name or "pro" in name)
-                and not any(bad in name for bad in ["embedding", "tts", "image", "vision", "audio", "robotics"])
+                and "flash" in name
+                and not any(
+                    bad in name
+                    for bad in [
+                        "omni", "exp", "preview", "2.0", "1.5", "1.0",
+                        "embedding", "tts", "image", "vision", "audio", "robotics", "thinking"
+                    ]
+                )
             ):
                 discovered.append(name)
-    except Exception as e:
-        st.sidebar.warning(f"Model list lookup note: {e}")
+    except Exception:
         return preferred_order
 
     ordered = [m for m in preferred_order if m in discovered]
@@ -146,7 +150,7 @@ def get_available_models():
     return ordered if ordered else preferred_order
 
 docs_dict, web_context = load_course_materials_dict()
-AVAILABLE_MODELS = get_available_models()
+AVAILABLE_MODELS = get_free_tier_models()
 
 # --- SIDEBAR: CHAPTER FOCUS, PROGRESS & ASSESSMENT HANDOFF ---
 CHAPTERS = [
@@ -203,7 +207,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    st.caption(f"Active models: `{', '.join(AVAILABLE_MODELS[:3])}`")
+    st.caption(f"Active models: `{', '.join(AVAILABLE_MODELS)}`")
 
 # --- MAIN CHAT INTERFACE ---
 st.title("📊 Q1 Statistics Catch-Up Tutor")
@@ -249,7 +253,8 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
         )
 
     with st.chat_message("assistant"):
-        attempt_queue = [AVAILABLE_MODELS[0], AVAILABLE_MODELS[0]] + AVAILABLE_MODELS[1:4]
+        # Retry the primary model up to 3 times with backoff before falling back
+        attempt_queue = [AVAILABLE_MODELS[0]] * 3 + AVAILABLE_MODELS[1:]
 
         reply_text = None
         last_error = None
@@ -274,7 +279,7 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
             except Exception as e:
                 last_error = e
                 err_str = str(e)
-                if any(code in err_str for code in ["503", "429", "404", "UNAVAILABLE", "NOT_FOUND"]):
+                if any(code in err_str for code in ["503", "429", "404", "UNAVAILABLE", "NOT_FOUND", "RESOURCE_EXHAUSTED"]):
                     time.sleep(2.0 * (attempt_idx + 1))
                     continue
                 else:
