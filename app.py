@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import streamlit as st
 from pypdf import PdfReader
@@ -33,16 +34,23 @@ CORE PEDAGOGICAL RULES (STRICT):
 3. CHECK FOR UNDERSTANDING: Before moving on from a concept, ask the student to explain it in their own words or apply it to a quick, low-stakes check question.
 4. TONE & DEMEANOR: Be warm, supportive, and conversational—like a helpful peer or approachable teacher. Avoid over-the-top cheerleading, excessive exclamation points, or robotic praise (do NOT say things like "Amazing job!! You're a superstar!!"). Keep encouragement grounded and authentic (e.g., "You've got the center right—now let's look at how spread affects that comparison.").
 5. GROUNDING IN COURSE MATERIALS: Base your explanations, definitions, and notation strictly on the provided Quarter 1 Reference Materials when available.
-6. ASSESSMENT HANDOFF: You do NOT administer or grade official tests or quizzes. When the student demonstrates a solid grasp of a chapter—or asks how to earn grades—remind them to check off that chapter in the sidebar and ask their teacher for the official makeup assessment for that chapter.
+6. ASSESSMENT HANDOFF: You do NOT administer or grade official tests or quizzes. When the student demonstrates a solid grasp of a chapter—or asks how to earn grades—remind her to check off that chapter in the sidebar and ask her teacher for the official makeup assessment for that chapter.
 """
 
-# --- RESOURCE INGESTION (CACHED) ---
-@st.cache_data(show_spinner="Loading Quarter 1 course materials...")
-def load_course_materials():
-    compiled_text = []
+# --- RESOURCE INGESTION (CACHED PER FILE FOR FAST FILTERING) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-    # 1. Load all PDFs from the 'materials' directory
-    pdf_files = sorted(glob.glob("materials/*.pdf"))
+@st.cache_data(show_spinner="Indexing Quarter 1 course materials...")
+def load_course_materials_dict():
+    """Returns a dictionary mapping filename -> extracted text, plus any web resources."""
+    docs = {}
+
+    materials_dir = os.path.join(BASE_DIR, "materials")
+    pdf_files = sorted(
+        glob.glob(os.path.join(materials_dir, "*.pdf"))
+        + glob.glob(os.path.join(BASE_DIR, "*.pdf"))
+    )
+
     for pdf_path in pdf_files:
         try:
             reader = PdfReader(pdf_path)
@@ -52,13 +60,14 @@ def load_course_materials():
                 text = page.extract_text()
                 if text:
                     pdf_text.append(f"[Page {i+1}]\n{text}")
-            compiled_text.append("\n".join(pdf_text))
+            docs[filename] = "\n".join(pdf_text)
         except Exception as e:
             st.warning(f"Could not read {pdf_path}: {e}")
 
-    # 2. Load any URLs listed in urls.txt
-    if os.path.exists("urls.txt"):
-        with open("urls.txt", "r", encoding="utf-8") as f:
+    web_text = []
+    urls_path = os.path.join(BASE_DIR, "urls.txt")
+    if os.path.exists(urls_path):
+        with open(urls_path, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
         for url in urls:
             try:
@@ -66,11 +75,36 @@ def load_course_materials():
                 if downloaded:
                     extracted = trafilatura.extract(downloaded)
                     if extracted:
-                        compiled_text.append(f"\n--- WEB RESOURCE: {url} ---\n{extracted}")
+                        web_text.append(f"\n--- WEB RESOURCE: {url} ---\n{extracted}")
             except Exception as e:
                 st.warning(f"Could not fetch {url}: {e}")
 
-    return "\n\n".join(compiled_text)
+    return docs, "\n\n".join(web_text)
+
+def get_filtered_context(docs_dict, web_context, selected_chapter):
+    """Filters PDFs to only the active chapter (matching 'Chapter 6', 'Ch 6', 'Ch06', etc.) for fast responses."""
+    if selected_chapter == "All Chapters (Slower)":
+        selected_texts = list(docs_dict.values())
+        matched_names = list(docs_dict.keys())
+    else:
+        # Extract chapter number (e.g., "6" from "Chapter 6 - Sample Surveys")
+        match = re.search(r"Chapter\s+(\d+)", selected_chapter, re.IGNORECASE)
+        ch_num = match.group(1) if match else ""
+        # Match patterns like "Chapter 6", "Chapter 06", "Ch 6", "Ch06", "Ch6"
+        pattern = re.compile(rf"(?:chapter|ch)[\s_-]*0?{ch_num}(?!\d)", re.IGNORECASE)
+
+        matched_names = [fname for fname in docs_dict if pattern.search(fname)]
+        if matched_names:
+            selected_texts = [docs_dict[fname] for fname in matched_names]
+        else:
+            # Fallback if no filename matches that chapter number
+            selected_texts = list(docs_dict.values())
+            matched_names = list(docs_dict.keys())
+
+    combined = "\n\n".join(selected_texts)
+    if web_context.strip():
+        combined += "\n\n" + web_context
+    return combined, matched_names
 
 # --- INITIALIZE GEMINI CLIENT ---
 def get_gemini_client():
@@ -81,9 +115,9 @@ def get_gemini_client():
     return genai.Client(api_key=api_key)
 
 client = get_gemini_client()
-reference_context = load_course_materials()
+docs_dict, web_context = load_course_materials_dict()
 
-# --- SIDEBAR: PROGRESS & ASSESSMENT HANDOFF ---
+# --- SIDEBAR: CHAPTER FOCUS, PROGRESS & ASSESSMENT HANDOFF ---
 CHAPTERS = [
     "Chapter 1 - Stats Starts Here",
     "Chapter 2 - Displaying and Describing Categorical Data",
@@ -96,12 +130,20 @@ CHAPTERS = [
 ]
 
 with st.sidebar:
-    st.header("📋 Q1 Catch-Up Plan")
-    st.markdown(
-        "Review missed notes, ask questions, and work through practice problems step-by-step."
+    st.header("🎯 Current Study Focus")
+    active_chapter = st.selectbox(
+        "Which chapter are you working on right now?",
+        options=CHAPTERS + ["All Chapters (Slower)"],
+        index=5,  # Defaults to Chapter 6; change index=0 if you want Chapter 1 as default
+        help="Filtering to one chapter loads only those PDFs so the tutor responds much faster."
     )
 
-    st.subheader("Chapters to Master")
+    reference_context, active_files = get_filtered_context(docs_dict, web_context, active_chapter)
+    if active_files:
+        st.caption("Active PDFs: " + ", ".join(f"`{f}`" for f in active_files))
+
+    st.divider()
+    st.header("📋 Q1 Catch-Up Plan")
     completed_count = 0
 
     st.caption("**Exploring & Understanding Data**")
@@ -132,7 +174,7 @@ with st.sidebar:
 
 # --- MAIN CHAT INTERFACE ---
 st.title("📊 Q1 Statistics Catch-Up Tutor")
-st.caption("Ask questions about Chapters 1–8 or share a practice problem to work through it step-by-step.")
+st.caption(f"Currently focused on: **{active_chapter}**")
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
@@ -140,24 +182,22 @@ if "messages" not in st.session_state:
             "role": "assistant",
             "content": (
                 "Welcome! I'm here to help you get caught up on Quarter 1 Statistics (Chapters 1–8) at your own pace. "
-                "We can review concepts from your class notes, break down vocabulary, or work through practice problems together—I'll give you hints and guide you step-by-step rather than just handing over answers.\n\n"
-                "Which chapter or practice problem do you want to start with today?"
+                "Use the **Current Study Focus** menu on the left to pick the chapter you're working on, then ask a question or share a practice problem—I'll give you hints and guide you step-by-step rather than just handing over answers.\n\n"
+                "What would you like to start with?"
             )
         }
     ]
 
-# Display conversation history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Handle student input
+# Handle student input with streaming response
 if prompt := st.chat_input("Ask a question or share what you have so far on a problem..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Build conversation payload with reference materials injected into system instructions
     full_system_instruction = SYSTEM_PROMPT
     if reference_context.strip():
         full_system_instruction += (
@@ -176,9 +216,9 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
         )
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                response = client.models.generate_content(
+        try:
+            def response_generator():
+                stream = client.models.generate_content_stream(
                     model="gemini-3.8-flash",
                     contents=gemini_contents,
                     config=types.GenerateContentConfig(
@@ -186,8 +226,11 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
                         temperature=0.4,
                     ),
                 )
-                reply_text = response.text
-                st.markdown(reply_text)
-                st.session_state.messages.append({"role": "assistant", "content": reply_text})
-            except Exception as e:
-                st.error(f"Error communicating with Gemini: {e}")
+                for chunk in stream:
+                    if chunk.text:
+                        yield chunk.text
+
+            reply_text = st.write_stream(response_generator())
+            st.session_state.messages.append({"role": "assistant", "content": reply_text})
+        except Exception as e:
+            st.error(f"Error communicating with Gemini: {e}")
