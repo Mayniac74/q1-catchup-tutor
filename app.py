@@ -1,6 +1,7 @@
 import os
 import re
 import glob
+import time
 import streamlit as st
 from pypdf import PdfReader
 import trafilatura
@@ -87,17 +88,14 @@ def get_filtered_context(docs_dict, web_context, selected_chapter):
         selected_texts = list(docs_dict.values())
         matched_names = list(docs_dict.keys())
     else:
-        # Extract chapter number (e.g., "6" from "Chapter 6 - Sample Surveys")
         match = re.search(r"Chapter\s+(\d+)", selected_chapter, re.IGNORECASE)
         ch_num = match.group(1) if match else ""
-        # Match patterns like "Chapter 6", "Chapter 06", "Ch 6", "Ch06", "Ch6"
         pattern = re.compile(rf"(?:chapter|ch)[\s_-]*0?{ch_num}(?!\d)", re.IGNORECASE)
 
         matched_names = [fname for fname in docs_dict if pattern.search(fname)]
         if matched_names:
             selected_texts = [docs_dict[fname] for fname in matched_names]
         else:
-            # Fallback if no filename matches that chapter number
             selected_texts = list(docs_dict.values())
             matched_names = list(docs_dict.keys())
 
@@ -134,7 +132,7 @@ with st.sidebar:
     active_chapter = st.selectbox(
         "Which chapter are you working on right now?",
         options=CHAPTERS + ["All Chapters (Slower)"],
-        index=5,  # Defaults to Chapter 6; change index=0 if you want Chapter 1 as default
+        index=0,
         help="Filtering to one chapter loads only those PDFs so the tutor responds much faster."
     )
 
@@ -192,7 +190,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Handle student input with streaming response
+# Handle student input with streaming response and automatic model fallback
 if prompt := st.chat_input("Ask a question or share what you have so far on a problem..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -216,21 +214,45 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
         )
 
     with st.chat_message("assistant"):
-        try:
-            def response_generator():
-                stream = client.models.generate_content_stream(
-                    model="gemini-3.8-flash",
-                    contents=gemini_contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=full_system_instruction,
-                        temperature=0.4,
-                    ),
-                )
-                for chunk in stream:
-                    if chunk.text:
-                        yield chunk.text
+        FALLBACK_MODELS = [
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-lite",
+            "gemini-2.5-flash",
+        ]
 
-            reply_text = st.write_stream(response_generator())
+        reply_text = None
+        last_error = None
+
+        for model_name in FALLBACK_MODELS:
+            try:
+                def response_generator(target_model=model_name):
+                    stream = client.models.generate_content_stream(
+                        model=target_model,
+                        contents=gemini_contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=full_system_instruction,
+                            temperature=0.4,
+                        ),
+                    )
+                    for chunk in stream:
+                        if chunk.text:
+                            yield chunk.text
+
+                reply_text = st.write_stream(response_generator())
+                break
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str:
+                    time.sleep(1.5)
+                    continue
+                else:
+                    break
+
+        if reply_text:
             st.session_state.messages.append({"role": "assistant", "content": reply_text})
-        except Exception as e:
-            st.error(f"Error communicating with Gemini: {e}")
+        else:
+            st.warning(
+                "The AI tutor is experiencing high traffic right now. Please wait a few seconds and send your message again."
+            )
+            st.caption(f"Technical details: {last_error}")
