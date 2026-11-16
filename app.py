@@ -110,30 +110,37 @@ def get_gemini_client():
     if not api_key:
         st.error("Missing GEMINI_API_KEY. Please add it to Streamlit Secrets.")
         st.stop()
-    return genai.Client(api_key=api_key)
+    # Explicitly use v1beta so all current Gemini 3 models are exposed
+    return genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
 
 client = get_gemini_client()
 
 @st.cache_data(ttl=3600)
 def get_available_models():
-    """Queries the API for valid generateContent models, prioritizing fast Flash models."""
+    """Queries the API for valid generateContent models on this key, prioritizing Flash models."""
     preferred_order = [
         "gemini-3.8-flash",
-        "gemini-3.8-pro",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
     ]
     discovered = []
     try:
         for m in client.models.list():
             name = m.name.replace("models/", "")
-            methods = getattr(m, "supported_generation_methods", []) or []
-            if "generateContent" in methods and "gemini" in name and "embedding" not in name and "tts" not in name:
+            # Exclude non-chat models (embeddings, image-only, tts, robotics, etc.)
+            if (
+                "gemini" in name
+                and ("flash" in name or "pro" in name)
+                and not any(bad in name for bad in ["embedding", "tts", "image", "vision", "audio", "robotics"])
+            ):
                 discovered.append(name)
-    except Exception:
+    except Exception as e:
+        st.sidebar.warning(f"Model list lookup note: {e}")
         return preferred_order
 
     ordered = [m for m in preferred_order if m in discovered]
-    for m in discovered:
-        if m not in ordered and ("flash" in m or "pro" in m):
+    for m in sorted(discovered, reverse=True):
+        if m not in ordered:
             ordered.append(m)
 
     return ordered if ordered else preferred_order
@@ -196,6 +203,8 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+    st.caption(f"Active models: `{', '.join(AVAILABLE_MODELS[:3])}`")
+
 # --- MAIN CHAT INTERFACE ---
 st.title("📊 Q1 Statistics Catch-Up Tutor")
 st.caption(f"Currently focused on: **{active_chapter}**")
@@ -240,7 +249,7 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
         )
 
     with st.chat_message("assistant"):
-        attempt_queue = [AVAILABLE_MODELS[0], AVAILABLE_MODELS[0]] + AVAILABLE_MODELS[1:]
+        attempt_queue = [AVAILABLE_MODELS[0], AVAILABLE_MODELS[0]] + AVAILABLE_MODELS[1:4]
 
         reply_text = None
         last_error = None
