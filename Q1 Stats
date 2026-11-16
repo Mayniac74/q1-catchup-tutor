@@ -1,0 +1,7 @@
+echo "# q1-catchup-tutor" >> README.md
+git init
+git add README.md
+git commit -m "first commit"
+git branch -M main
+git remote add origin https://github.com/Mayniac74/q1-catchup-tutor.git
+git push -u origin main
