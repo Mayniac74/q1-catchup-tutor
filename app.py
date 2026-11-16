@@ -115,7 +115,7 @@ with st.sidebar:
             completed_count += 1
 
     st.progress(completed_count / len(CHAPTERS))
-    st.caption(f"Progress: **{completed_count} of {len(CHAPTERS)}** chapters checked off")
+    st.caption(f"Session Progress: **{completed_count} of {len(CHAPTERS)}** checked")
 
     st.divider()
     st.subheader("Ready for a Grade?")
