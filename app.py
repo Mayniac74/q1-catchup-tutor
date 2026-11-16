@@ -47,7 +47,7 @@ def get_gemini_client():
 
 client = get_gemini_client()
 
-# --- UPLOAD & CACHE PDFS VIA GEMINI FILE API (FAST & LOW TOKEN OVERHEAD) ---
+# --- UPLOAD & CACHE PDFS VIA GEMINI FILE API ---
 def find_local_pdfs():
     materials_dir = os.path.join(BASE_DIR, "materials")
     return sorted(
@@ -57,11 +57,11 @@ def find_local_pdfs():
 
 @st.cache_resource(ttl=3600 * 24, show_spinner="Preparing chapter PDF...")
 def get_uploaded_gemini_file(pdf_path):
-    """Uploads a single PDF to Gemini's File API and caches the file reference for 24 hours."""
+    """Uploads a single PDF to Gemini's File API and returns the remote file object."""
     return client.files.upload(file=pdf_path)
 
 def get_chapter_file_parts(selected_chapter):
-    """Matches only PDFs for the selected chapter and returns Gemini File references."""
+    """Matches active chapter PDFs and returns valid URI Part references."""
     all_pdfs = find_local_pdfs()
     if not all_pdfs:
         return [], []
@@ -76,16 +76,20 @@ def get_chapter_file_parts(selected_chapter):
         if not matched_paths:
             matched_paths = all_pdfs
 
-    uploaded_refs = []
+    uri_parts = []
     matched_names = []
     for path in matched_paths:
         try:
-            uploaded_refs.append(get_uploaded_gemini_file(path))
+            remote_file = get_uploaded_gemini_file(path)
+            # Correctly reference uploaded files via URI
+            uri_parts.append(
+                types.Part.from_uri(file_uri=remote_file.uri, mime_type="application/pdf")
+            )
             matched_names.append(os.path.basename(path))
         except Exception as e:
             st.sidebar.warning(f"Could not attach {os.path.basename(path)}: {e}")
 
-    return uploaded_refs, matched_names
+    return uri_parts, matched_names
 
 # --- SIDEBAR: CHAPTER FOCUS, PROGRESS & ASSESSMENT HANDOFF ---
 CHAPTERS = [
@@ -108,7 +112,7 @@ with st.sidebar:
         help="Select the chapter you are studying so only those PDFs are attached."
     )
 
-    active_file_refs, active_names = get_chapter_file_parts(active_chapter)
+    active_file_parts, active_names = get_chapter_file_parts(active_chapter)
     if active_names:
         st.caption("Active PDFs: " + ", ".join(f"`{f}`" for f in active_names))
     else:
@@ -170,13 +174,13 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Attach the active chapter PDFs once on the first user turn so Gemini caches them across the conversation
+    # Attach the active chapter PDFs on the first user message using proper URI parts
     gemini_contents = []
     for idx, m in enumerate(st.session_state.messages):
         role = "user" if m["role"] == "user" else "model"
         parts = []
-        if idx == 1 and role == "user" and active_file_refs:
-            parts.extend(active_file_refs)
+        if idx == 1 and role == "user" and active_file_parts:
+            parts.extend(active_file_parts)
         parts.append(types.Part.from_text(text=m["content"]))
         gemini_contents.append(types.Content(role=role, parts=parts))
 
