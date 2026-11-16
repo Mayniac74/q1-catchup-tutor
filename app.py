@@ -1,10 +1,7 @@
 import os
 import re
 import glob
-import time
 import streamlit as st
-from pypdf import PdfReader
-import trafilatura
 from google import genai
 from google.genai import types
 
@@ -34,77 +31,13 @@ CORE PEDAGOGICAL RULES (STRICT):
 2. SCAFFOLDING & HINTS: Break problems down into small, manageable steps. Ask one guiding question at a time to help the student uncover the next step themselves. Use relatable, real-world analogies when explaining abstract concepts (e.g., comparing z-scores across different scales, distinguishing confounding from lurking variables, or clarifying why voluntary response introduces bias).
 3. CHECK FOR UNDERSTANDING: Before moving on from a concept, ask the student to explain it in their own words or apply it to a quick, low-stakes check question.
 4. TONE & DEMEANOR: Be warm, supportive, and conversational—like a helpful peer or approachable teacher. Avoid over-the-top cheerleading, excessive exclamation points, or robotic praise (do NOT say things like "Amazing job!! You're a superstar!!"). Keep encouragement grounded and authentic (e.g., "You've got the center right—now let's look at how spread affects that comparison.").
-5. GROUNDING IN COURSE MATERIALS: Base your explanations, definitions, and notation strictly on the provided Quarter 1 Reference Materials when available.
+5. GROUNDING IN COURSE MATERIALS: Base your explanations, definitions, and notation strictly on the attached Quarter 1 PDF reference materials when available.
 6. ASSESSMENT HANDOFF: You do NOT administer or grade official tests or quizzes. When the student demonstrates a solid grasp of a chapter—or asks how to earn grades—remind her to check off that chapter in the sidebar and ask her teacher for the official makeup assessment for that chapter.
 """
 
-# --- RESOURCE INGESTION (CACHED PER FILE FOR FAST FILTERING) ---
+# --- INITIALIZE GEMINI CLIENT ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-@st.cache_data(show_spinner="Indexing Quarter 1 course materials...")
-def load_course_materials_dict():
-    """Returns a dictionary mapping filename -> extracted text, plus any web resources."""
-    docs = {}
-
-    materials_dir = os.path.join(BASE_DIR, "materials")
-    pdf_files = sorted(
-        glob.glob(os.path.join(materials_dir, "*.pdf"))
-        + glob.glob(os.path.join(BASE_DIR, "*.pdf"))
-    )
-
-    for pdf_path in pdf_files:
-        try:
-            reader = PdfReader(pdf_path)
-            filename = os.path.basename(pdf_path)
-            pdf_text = [f"\n--- SOURCE DOCUMENT: {filename} ---"]
-            for i, page in enumerate(reader.pages):
-                text = page.extract_text()
-                if text:
-                    pdf_text.append(f"[Page {i+1}]\n{text}")
-            docs[filename] = "\n".join(pdf_text)
-        except Exception as e:
-            st.warning(f"Could not read {pdf_path}: {e}")
-
-    web_text = []
-    urls_path = os.path.join(BASE_DIR, "urls.txt")
-    if os.path.exists(urls_path):
-        with open(urls_path, "r", encoding="utf-8") as f:
-            urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-        for url in urls:
-            try:
-                downloaded = trafilatura.fetch_url(url)
-                if downloaded:
-                    extracted = trafilatura.extract(downloaded)
-                    if extracted:
-                        web_text.append(f"\n--- WEB RESOURCE: {url} ---\n{extracted}")
-            except Exception as e:
-                st.warning(f"Could not fetch {url}: {e}")
-
-    return docs, "\n\n".join(web_text)
-
-def get_filtered_context(docs_dict, web_context, selected_chapter):
-    """Filters PDFs to only the active chapter (matching 'Chapter 6', 'Ch 6', 'Ch06', etc.) for fast responses."""
-    if selected_chapter == "All Chapters (Slower)":
-        selected_texts = list(docs_dict.values())
-        matched_names = list(docs_dict.keys())
-    else:
-        match = re.search(r"Chapter\s+(\d+)", selected_chapter, re.IGNORECASE)
-        ch_num = match.group(1) if match else ""
-        pattern = re.compile(rf"(?:chapter|ch)[\s_-]*0?{ch_num}(?!\d)", re.IGNORECASE)
-
-        matched_names = [fname for fname in docs_dict if pattern.search(fname)]
-        if matched_names:
-            selected_texts = [docs_dict[fname] for fname in matched_names]
-        else:
-            selected_texts = list(docs_dict.values())
-            matched_names = list(docs_dict.keys())
-
-    combined = "\n\n".join(selected_texts)
-    if web_context.strip():
-        combined += "\n\n" + web_context
-    return combined, matched_names
-
-# --- INITIALIZE GEMINI CLIENT & FILTER FOR FREE-TIER COMPATIBLE FLASH MODELS ---
 def get_gemini_client():
     api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -114,43 +47,45 @@ def get_gemini_client():
 
 client = get_gemini_client()
 
-@st.cache_data(ttl=3600)
-def get_free_tier_models():
-    """Selects only standard Flash models that support Free Tier quotas (excludes omni/exp/2.0/pro)."""
-    preferred_order = [
-        "gemini-3.8-flash",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-    ]
-    discovered = []
-    try:
-        for m in client.models.list():
-            name = m.name.replace("models/", "")
-            # Only keep standard flash models; exclude omni, experimental, 2.0, and non-text models
-            if (
-                "gemini" in name
-                and "flash" in name
-                and not any(
-                    bad in name
-                    for bad in [
-                        "omni", "exp", "preview", "2.0", "1.5", "1.0",
-                        "embedding", "tts", "image", "vision", "audio", "robotics", "thinking"
-                    ]
-                )
-            ):
-                discovered.append(name)
-    except Exception:
-        return preferred_order
+# --- UPLOAD & CACHE PDFS VIA GEMINI FILE API (FAST & LOW TOKEN OVERHEAD) ---
+def find_local_pdfs():
+    materials_dir = os.path.join(BASE_DIR, "materials")
+    return sorted(
+        glob.glob(os.path.join(materials_dir, "*.pdf"))
+        + glob.glob(os.path.join(BASE_DIR, "*.pdf"))
+    )
 
-    ordered = [m for m in preferred_order if m in discovered]
-    for m in sorted(discovered, reverse=True):
-        if m not in ordered:
-            ordered.append(m)
+@st.cache_resource(ttl=3600 * 24, show_spinner="Preparing chapter PDF...")
+def get_uploaded_gemini_file(pdf_path):
+    """Uploads a single PDF to Gemini's File API and caches the file reference for 24 hours."""
+    return client.files.upload(file=pdf_path)
 
-    return ordered if ordered else preferred_order
+def get_chapter_file_parts(selected_chapter):
+    """Matches only PDFs for the selected chapter and returns Gemini File references."""
+    all_pdfs = find_local_pdfs()
+    if not all_pdfs:
+        return [], []
 
-docs_dict, web_context = load_course_materials_dict()
-AVAILABLE_MODELS = get_free_tier_models()
+    if selected_chapter == "All Chapters (Slower)":
+        matched_paths = all_pdfs
+    else:
+        match = re.search(r"Chapter\s+(\d+)", selected_chapter, re.IGNORECASE)
+        ch_num = match.group(1) if match else ""
+        pattern = re.compile(rf"(?:chapter|ch)[\s_-]*0?{ch_num}(?!\d)", re.IGNORECASE)
+        matched_paths = [p for p in all_pdfs if pattern.search(os.path.basename(p))]
+        if not matched_paths:
+            matched_paths = all_pdfs
+
+    uploaded_refs = []
+    matched_names = []
+    for path in matched_paths:
+        try:
+            uploaded_refs.append(get_uploaded_gemini_file(path))
+            matched_names.append(os.path.basename(path))
+        except Exception as e:
+            st.sidebar.warning(f"Could not attach {os.path.basename(path)}: {e}")
+
+    return uploaded_refs, matched_names
 
 # --- SIDEBAR: CHAPTER FOCUS, PROGRESS & ASSESSMENT HANDOFF ---
 CHAPTERS = [
@@ -170,12 +105,14 @@ with st.sidebar:
         "Which chapter are you working on right now?",
         options=CHAPTERS + ["All Chapters (Slower)"],
         index=0,
-        help="Filtering to one chapter loads only those PDFs so the tutor responds much faster."
+        help="Select the chapter you are studying so only those PDFs are attached."
     )
 
-    reference_context, active_files = get_filtered_context(docs_dict, web_context, active_chapter)
-    if active_files:
-        st.caption("Active PDFs: " + ", ".join(f"`{f}`" for f in active_files))
+    active_file_refs, active_names = get_chapter_file_parts(active_chapter)
+    if active_names:
+        st.caption("Active PDFs: " + ", ".join(f"`{f}`" for f in active_names))
+    else:
+        st.caption("No PDFs found in repository.")
 
     st.divider()
     st.header("📋 Q1 Catch-Up Plan")
@@ -207,8 +144,6 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    st.caption(f"Active models: `{', '.join(AVAILABLE_MODELS)}`")
-
 # --- MAIN CHAT INTERFACE ---
 st.title("📊 Q1 Statistics Catch-Up Tutor")
 st.caption(f"Currently focused on: **{active_chapter}**")
@@ -229,66 +164,41 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Handle student input with streaming response and automatic retry/fallback
+# Handle student input
 if prompt := st.chat_input("Ask a question or share what you have so far on a problem..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    full_system_instruction = SYSTEM_PROMPT
-    if reference_context.strip():
-        full_system_instruction += (
-            "\n\n=== QUARTER 1 REFERENCE MATERIALS ===\n"
-            + reference_context
-        )
-
+    # Attach the active chapter PDFs once on the first user turn so Gemini caches them across the conversation
     gemini_contents = []
-    for m in st.session_state.messages:
+    for idx, m in enumerate(st.session_state.messages):
         role = "user" if m["role"] == "user" else "model"
-        gemini_contents.append(
-            types.Content(
-                role=role,
-                parts=[types.Part.from_text(text=m["content"])]
-            )
-        )
+        parts = []
+        if idx == 1 and role == "user" and active_file_refs:
+            parts.extend(active_file_refs)
+        parts.append(types.Part.from_text(text=m["content"]))
+        gemini_contents.append(types.Content(role=role, parts=parts))
 
     with st.chat_message("assistant"):
-        # Retry the primary model up to 3 times with backoff before falling back
-        attempt_queue = [AVAILABLE_MODELS[0]] * 3 + AVAILABLE_MODELS[1:]
-
-        reply_text = None
-        last_error = None
-
-        for attempt_idx, model_name in enumerate(attempt_queue):
+        with st.spinner("Thinking..."):
             try:
-                def response_generator(target_model=model_name):
-                    stream = client.models.generate_content_stream(
-                        model=target_model,
-                        contents=gemini_contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=full_system_instruction,
-                            temperature=0.4,
-                        ),
-                    )
-                    for chunk in stream:
-                        if chunk.text:
-                            yield chunk.text
-
-                reply_text = st.write_stream(response_generator())
-                break
+                response = client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=gemini_contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=0.4,
+                    ),
+                )
+                reply_text = response.text
+                st.markdown(reply_text)
+                st.session_state.messages.append({"role": "assistant", "content": reply_text})
             except Exception as e:
-                last_error = e
                 err_str = str(e)
-                if any(code in err_str for code in ["503", "429", "404", "UNAVAILABLE", "NOT_FOUND", "RESOURCE_EXHAUSTED"]):
-                    time.sleep(2.0 * (attempt_idx + 1))
-                    continue
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    st.warning("Google's Gemini server is momentarily busy (503). Wait 5 seconds and click send again.")
+                elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    st.warning("Rate limit reached on the free API tier. Wait ~30 seconds before sending your next message.")
                 else:
-                    break
-
-        if reply_text:
-            st.session_state.messages.append({"role": "assistant", "content": reply_text})
-        else:
-            st.warning(
-                "The AI tutor is experiencing high traffic right now. Please wait a few seconds and send your message again."
-            )
-            st.caption(f"Technical details: {last_error}")
+                    st.error(f"Error communicating with Gemini: {e}")
