@@ -104,7 +104,7 @@ def get_filtered_context(docs_dict, web_context, selected_chapter):
         combined += "\n\n" + web_context
     return combined, matched_names
 
-# --- INITIALIZE GEMINI CLIENT ---
+# --- INITIALIZE GEMINI CLIENT & AUTO-DISCOVER AVAILABLE MODELS ---
 def get_gemini_client():
     api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -113,7 +113,33 @@ def get_gemini_client():
     return genai.Client(api_key=api_key)
 
 client = get_gemini_client()
+
+@st.cache_data(ttl=3600)
+def get_available_models():
+    """Queries the API for valid generateContent models, prioritizing fast Flash models."""
+    preferred_order = [
+        "gemini-3.8-flash",
+        "gemini-3.8-pro",
+    ]
+    discovered = []
+    try:
+        for m in client.models.list():
+            name = m.name.replace("models/", "")
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if "generateContent" in methods and "gemini" in name and "embedding" not in name and "tts" not in name:
+                discovered.append(name)
+    except Exception:
+        return preferred_order
+
+    ordered = [m for m in preferred_order if m in discovered]
+    for m in discovered:
+        if m not in ordered and ("flash" in m or "pro" in m):
+            ordered.append(m)
+
+    return ordered if ordered else preferred_order
+
 docs_dict, web_context = load_course_materials_dict()
+AVAILABLE_MODELS = get_available_models()
 
 # --- SIDEBAR: CHAPTER FOCUS, PROGRESS & ASSESSMENT HANDOFF ---
 CHAPTERS = [
@@ -190,7 +216,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Handle student input with streaming response and automatic model fallback
+# Handle student input with streaming response and automatic retry/fallback
 if prompt := st.chat_input("Ask a question or share what you have so far on a problem..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -214,16 +240,12 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
         )
 
     with st.chat_message("assistant"):
-        FALLBACK_MODELS = [
-            "gemini-3.8-flash",
-            "gemini-3.8-flash-lite",
-            "gemini-2.5-flash",
-        ]
+        attempt_queue = [AVAILABLE_MODELS[0], AVAILABLE_MODELS[0]] + AVAILABLE_MODELS[1:]
 
         reply_text = None
         last_error = None
 
-        for model_name in FALLBACK_MODELS:
+        for attempt_idx, model_name in enumerate(attempt_queue):
             try:
                 def response_generator(target_model=model_name):
                     stream = client.models.generate_content_stream(
@@ -243,8 +265,8 @@ if prompt := st.chat_input("Ask a question or share what you have so far on a pr
             except Exception as e:
                 last_error = e
                 err_str = str(e)
-                if "503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str:
-                    time.sleep(1.5)
+                if any(code in err_str for code in ["503", "429", "404", "UNAVAILABLE", "NOT_FOUND"]):
+                    time.sleep(2.0 * (attempt_idx + 1))
                     continue
                 else:
                     break
